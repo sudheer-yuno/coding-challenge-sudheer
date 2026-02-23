@@ -9,6 +9,7 @@ import (
 	"coding-challenge/internal/models"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	_ "github.com/lib/pq"
 )
 
@@ -48,8 +49,8 @@ func (r *Repository) CreateBatch(ctx context.Context, items []models.CreatePayou
 
 	// Insert all payouts
 	stmt, err := tx.PrepareContext(ctx,
-		`INSERT INTO payouts (id, batch_id, idempotency_key, vendor_id, vendor_name, amount, currency, bank_account, bank_name, status, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`)
+		`INSERT INTO payouts (id, batch_id, idempotency_key, vendor_id, vendor_name, amount, currency, bank_account, bank_name, transaction_ids, status, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`)
 	if err != nil {
 		return nil, fmt.Errorf("prepare stmt: %w", err)
 	}
@@ -62,7 +63,8 @@ func (r *Repository) CreateBatch(ctx context.Context, items []models.CreatePayou
 		_, err = stmt.ExecContext(ctx,
 			payoutID, batchID, idempotencyKey,
 			item.VendorID, item.VendorName, item.Amount, item.Currency,
-			item.BankAccount, item.BankName, models.PayoutStatusPending, now, now,
+			item.BankAccount, item.BankName, pq.Array(item.TransactionIDs),
+			models.PayoutStatusPending, now, now,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("insert payout for vendor %s: %w", item.VendorID, err)
@@ -141,7 +143,7 @@ func (r *Repository) RefreshBatchCounts(ctx context.Context, batchID uuid.UUID) 
 func (r *Repository) GetPendingPayouts(ctx context.Context, batchID uuid.UUID, limit int) ([]models.Payout, error) {
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT id, batch_id, idempotency_key, vendor_id, vendor_name, amount, currency,
-		        bank_account, bank_name, status, failure_reason, attempt_count, max_retries,
+		        bank_account, bank_name, transaction_ids, status, failure_reason, attempt_count, max_retries,
 		        created_at, attempted_at, completed_at, updated_at
 		 FROM payouts
 		 WHERE batch_id = $1 AND status IN ($2, $3)
@@ -232,7 +234,7 @@ func (r *Repository) GetPayoutsByBatch(ctx context.Context, batchID uuid.UUID, s
 	if status != "" {
 		rows, err = r.db.QueryContext(ctx,
 			`SELECT id, batch_id, idempotency_key, vendor_id, vendor_name, amount, currency,
-			        bank_account, bank_name, status, failure_reason, attempt_count, max_retries,
+			        bank_account, bank_name, transaction_ids, status, failure_reason, attempt_count, max_retries,
 			        created_at, attempted_at, completed_at, updated_at
 			 FROM payouts WHERE batch_id = $1 AND status = $2
 			 ORDER BY created_at ASC LIMIT $3 OFFSET $4`,
@@ -240,7 +242,7 @@ func (r *Repository) GetPayoutsByBatch(ctx context.Context, batchID uuid.UUID, s
 	} else {
 		rows, err = r.db.QueryContext(ctx,
 			`SELECT id, batch_id, idempotency_key, vendor_id, vendor_name, amount, currency,
-			        bank_account, bank_name, status, failure_reason, attempt_count, max_retries,
+			        bank_account, bank_name, transaction_ids, status, failure_reason, attempt_count, max_retries,
 			        created_at, attempted_at, completed_at, updated_at
 			 FROM payouts WHERE batch_id = $1
 			 ORDER BY created_at ASC LIMIT $2 OFFSET $3`,
@@ -328,7 +330,8 @@ func scanPayouts(rows *sql.Rows) ([]models.Payout, error) {
 		var p models.Payout
 		err := rows.Scan(
 			&p.ID, &p.BatchID, &p.IdempotencyKey, &p.VendorID, &p.VendorName,
-			&p.Amount, &p.Currency, &p.BankAccount, &p.BankName, &p.Status,
+			&p.Amount, &p.Currency, &p.BankAccount, &p.BankName,
+			pq.Array(&p.TransactionIDs), &p.Status,
 			&p.FailureReason, &p.AttemptCount, &p.MaxRetries,
 			&p.CreatedAt, &p.AttemptedAt, &p.CompletedAt, &p.UpdatedAt,
 		)

@@ -1,53 +1,58 @@
 # Kaveri Market — Batch Payout Processing Engine
 
-A reliable, resumable batch payout processing engine built in Go with PostgreSQL.
+A reliable, resumable batch payout processing engine built in **Go** with **PostgreSQL**.
+
+Solves Kaveri Market's payout bottleneck: processes thousands of vendor payouts concurrently, handles failures gracefully, and can be stopped and resumed without duplicate payments.
 
 ## Architecture
 
 ```
 ┌──────────────┐     ┌──────────────┐     ┌────────────────┐     ┌──────────────┐
-│   REST API   │────▶│   Service    │────▶│  Worker Pool   │────▶│  Simulated   │
-│  (Gin HTTP)  │     │  (Handlers)  │     │ (N concurrent) │     │  Bank API    │
+│   REST API   │────▶│   Handlers   │────▶│  Worker Pool   │────▶│  Simulated   │
+│  (Gin HTTP)  │     │  (6 routes)  │     │ (N concurrent) │     │  Bank API    │
 └──────────────┘     └──────────────┘     └────────────────┘     └──────────────┘
                             │                      │
                             └──────────┬───────────┘
                                        ▼
                               ┌──────────────────┐
                               │   PostgreSQL DB   │
-                              │ (State Machine)   │
+                              │  (State Machine)  │
                               └──────────────────┘
 ```
 
 ### Key Design Decisions
 
-1. **DB-driven state machine**: Each payout has a status (`pending → processing → completed/failed`). Resumability comes from querying unfinshed payouts, not from cursors.
-
-2. **Claim-before-process**: Workers atomically transition payouts to `processing` before executing. This prevents double-processing even with concurrent workers.
-
-3. **Idempotency via unique key**: `vendor_id:batch_id` is a unique constraint. The same vendor can't appear twice in a batch.
-
-4. **Crash recovery**: On startup/resume, any payouts stuck in `processing` are reset to `pending` and retried.
-
-5. **Chunked processing**: Payouts are fetched and processed in configurable chunks to avoid loading everything into memory.
+| Decision | Why |
+|----------|-----|
+| **DB-driven state machine** | Each payout has a status (`pending → processing → completed/failed`). Resumability comes from querying unfinished payouts, not from in-memory cursors. |
+| **Claim-before-process** | Workers atomically transition payouts to `processing` before executing. Prevents double-processing even with concurrent workers. |
+| **Idempotency via unique key** | `vendor_id:batch_id` is a UNIQUE constraint. The same vendor can't appear twice in a batch, and retries are safe. |
+| **Crash recovery on resume** | On startup/resume, any payouts stuck in `processing` are reset to `pending` and retried safely. |
+| **Chunked processing** | Payouts are fetched in configurable chunks to avoid loading everything into memory. |
+| **Automatic retries** | Retryable failures (timeout, rate limit, insufficient funds) are retried up to 3 times before being marked as permanently failed. |
 
 ## Project Structure
 
 ```
 coding-challenge/
-├── cmd/server/main.go              # Entry point
+├── cmd/server/main.go              # Entry point, config, DB setup
 ├── internal/
 │   ├── api/
-│   │   ├── handlers.go             # HTTP request handlers
+│   │   ├── handlers.go             # HTTP request handlers (6 endpoints)
 │   │   └── router.go               # Route definitions
-│   ├── models/models.go            # Data models & constants
-│   ├── repository/repository.go    # Database operations
-│   ├── service/simulator.go        # Simulated bank API
-│   └── worker/pool.go              # Concurrent worker pool
-├── migrations/001_init.sql         # Database schema
-├── scripts/seed.go                 # Test data generator
-├── docker-compose.yml              # PostgreSQL + App
-├── Dockerfile                      # Multi-stage build
-├── Makefile                        # Build commands
+│   ├── models/models.go            # Data models, constants, request/response types
+│   ├── repository/repository.go    # All database operations
+│   ├── service/simulator.go        # Simulated bank API with realistic outcomes
+│   └── worker/
+│       ├── pool.go                 # Concurrent worker pool with resumability
+│       └── pool_test.go            # Integration tests
+├── migrations/001_init.sql         # PostgreSQL schema (3 tables)
+├── scripts/
+│   ├── seed.go                     # Test data generator (3 batches: 100, 1K, 5K)
+│   └── demo.sh                     # Interactive demo script
+├── docker-compose.yml              # One-command setup (PostgreSQL + App)
+├── Dockerfile                      # Multi-stage Go build
+├── Makefile                        # Build shortcuts
 └── README.md
 ```
 
@@ -58,7 +63,7 @@ coding-challenge/
 docker-compose up --build -d
 ```
 
-### Option 2: Local
+### Option 2: Local Development
 ```bash
 # Start PostgreSQL
 docker run -d --name kaveri-db \
@@ -70,77 +75,162 @@ docker run -d --name kaveri-db \
 # Run migrations
 psql -h localhost -U postgres -d kaveri_payouts -f migrations/001_init.sql
 
-# Build and run
+# Download dependencies and run
+go mod tidy
 make run
 ```
 
-## API Usage
+## API Endpoints
 
-### 1. Create a batch
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/v1/batches` | Create a new batch of payouts |
+| `GET` | `/api/v1/batches/:id` | Get batch status with summary statistics |
+| `POST` | `/api/v1/batches/:id/start` | Start or resume processing a batch |
+| `POST` | `/api/v1/batches/:id/stop` | Gracefully stop processing |
+| `GET` | `/api/v1/batches/:id/payouts` | List payouts (filter by `?status=failed&page=1&page_size=50`) |
+| `POST` | `/api/v1/batches/:id/retry-failed` | Retry all retryable failed payouts |
+| `GET` | `/health` | Health check |
+
+## Test Data
+
+The seed script generates **3 batches** with realistic Southeast Asian marketplace data:
+
+```bash
+go run scripts/seed.go
+```
+
+This creates:
+- **Small batch**: 100 payouts (quick validation)
+- **Medium batch**: 1,000 payouts (standard processing)
+- **Large batch**: 5,000 payouts (NOT auto-started — reserved for resumability demo)
+
+Each payout includes:
+- **Vendor ID**: Region-prefixed with category (e.g., `KV-ID-cra-00042`)
+- **Vendor name**: Descriptive with region
+- **Bank account**: Masked format (e.g., `ID****4521`)
+- **Bank name**: Real Southeast Asian banks (BCA, Mandiri, BDO, Vietcombank, etc.)
+- **Amount + Currency**: Realistic ranges per currency (IDR, PHP, VND)
+- **Transaction IDs**: 1-5 accumulated sale transaction references per vendor
+
+### Failure Distribution (Simulated)
+
+| Outcome | Probability | Retryable | Description |
+|---------|-------------|-----------|-------------|
+| ✅ Success | 85% | — | Transfer completed |
+| ❌ Invalid Bank Account | 5% | No | Permanent — bad bank details |
+| ❌ Bank API Timeout | 3% | Yes | Transient — retried automatically |
+| ❌ Insufficient Funds | 3% | Yes | Transient — retried automatically |
+| ❌ Account Blocked | 2% | No | Permanent — vendor suspended |
+| ❌ Rate Limited | 2% | Yes | Transient — retried automatically |
+
+## Demo: Full Walkthrough
+
+### Interactive Demo Script
+```bash
+bash scripts/demo.sh
+```
+
+This walks through all acceptance criteria interactively.
+
+### Manual Demo
+
+#### 1. Create a batch
 ```bash
 curl -X POST http://localhost:8080/api/v1/batches \
   -H "Content-Type: application/json" \
   -d '{
     "payouts": [
-      {"vendor_id": "v001", "vendor_name": "Vendor A", "amount": 150.00, "currency": "IDR", "bank_account": "1234567890", "bank_name": "BCA"},
-      {"vendor_id": "v002", "vendor_name": "Vendor B", "amount": 250.50, "currency": "PHP", "bank_account": "0987654321", "bank_name": "BDO"}
+      {
+        "vendor_id": "KV-ID-001",
+        "vendor_name": "Bali Crafts Shop",
+        "amount": 2500000,
+        "currency": "IDR",
+        "bank_account": "ID****7823",
+        "bank_name": "BCA",
+        "transaction_ids": ["TXN-001-A", "TXN-001-B", "TXN-001-C"]
+      },
+      {
+        "vendor_id": "KV-PH-002",
+        "vendor_name": "Manila Electronics Hub",
+        "amount": 15750.50,
+        "currency": "PHP",
+        "bank_account": "PH****3341",
+        "bank_name": "BDO",
+        "transaction_ids": ["TXN-002-A"]
+      }
     ]
   }'
 ```
 
-### 2. Start/resume processing
+#### 2. Start processing
 ```bash
 curl -X POST http://localhost:8080/api/v1/batches/{batch_id}/start
 ```
 
-### 3. Check batch status
+#### 3. Monitor progress (during processing)
 ```bash
+# Summary statistics
 curl http://localhost:8080/api/v1/batches/{batch_id}
+
+# Example response:
+# {
+#   "batch": { "status": "in_progress", "total_count": 5000, ... },
+#   "statistics": {
+#     "total": 5000,
+#     "completed": 3241,
+#     "failed": 412,
+#     "pending": 1347,
+#     "processing": 0,
+#     "success_rate_percent": 64.82,
+#     "completion_rate_percent": 73.06
+#   }
+# }
 ```
 
-### 4. View failed payouts
+#### 4. Inspect failures
 ```bash
-curl "http://localhost:8080/api/v1/batches/{batch_id}/payouts?status=failed"
+curl "http://localhost:8080/api/v1/batches/{batch_id}/payouts?status=failed&page=1&page_size=10"
 ```
 
-### 5. Retry failed payouts
+#### 5. Demonstrate resumability
 ```bash
-curl -X POST http://localhost:8080/api/v1/batches/{batch_id}/retry-failed
-```
+# Start the large batch
+curl -X POST http://localhost:8080/api/v1/batches/{batch_id}/start
 
-### 6. Stop processing (graceful)
-```bash
-curl -X POST http://localhost:8080/api/v1/batches/{batch_id}/stop
-```
+# Check partial progress
+curl http://localhost:8080/api/v1/batches/{batch_id}
+# → Shows e.g. 2,100/5,000 processed
 
-## Seed Test Data
+# Kill the server (Ctrl+C or kill the process)
 
-Generate 1000 (or custom count) vendor payouts and start processing:
-```bash
-go run scripts/seed.go        # Default: 1000 payouts
-go run scripts/seed.go 5000   # Custom: 5000 payouts
-```
-
-## Testing Resumability
-
-```bash
-# 1. Seed a large batch
-go run scripts/seed.go 5000
-
-# 2. Watch it process
-curl http://localhost:8080/api/v1/batches/{id}
-
-# 3. Kill the server mid-processing (Ctrl+C or kill)
-
-# 4. Restart the server
+# Restart the server
 make run
 
-# 5. Resume the batch — it picks up where it left off
-curl -X POST http://localhost:8080/api/v1/batches/{id}/start
+# Resume — picks up where it left off
+curl -X POST http://localhost:8080/api/v1/batches/{batch_id}/start
 
-# 6. Verify no duplicates — completed count should never exceed total
-curl http://localhost:8080/api/v1/batches/{id}
+# Verify completion — total should equal 5,000 with NO duplicates
+curl http://localhost:8080/api/v1/batches/{batch_id}
+# → completed + failed = 5,000
 ```
+
+#### 6. Retry failed payouts
+```bash
+curl -X POST http://localhost:8080/api/v1/batches/{batch_id}/retry-failed
+# → {"message": "Retrying failed payouts", "requeued": 47}
+```
+
+## Acceptance Criteria Verification
+
+| Criteria | Status | Evidence |
+|----------|--------|----------|
+| ✅ Batch submitted and processed automatically | Pass | `POST /batches` + `POST /batches/:id/start` |
+| ✅ Individual failures recorded with reasons, don't block processing | Pass | `failure_reason` field, isolated goroutines per payout |
+| ✅ Stop mid-batch and resume without duplicates | Pass | `POST /stop` + `POST /start`, `ResetStuckProcessing()`, unique idempotency key |
+| ✅ API exposes batch status, payout statuses, summary stats | Pass | 6 API endpoints with filtering and pagination |
+| ✅ Demonstrable with test data | Pass | `seed.go` (3 batches) + `demo.sh` (interactive) |
+| ✅ Runnable with clear setup instructions | Pass | Docker Compose one-liner or local setup steps |
 
 ## Configuration
 
@@ -155,15 +245,18 @@ curl http://localhost:8080/api/v1/batches/{id}
 | `WORKER_CONCURRENCY` | `10` | Number of concurrent workers |
 | `WORKER_CHUNK_SIZE` | `100` | Payouts fetched per chunk |
 
-## Simulated Failure Distribution
+## Running Tests
 
-| Outcome | Probability | Retryable |
-|---------|-------------|-----------|
-| Success | 85% | — |
-| Invalid Bank Account | 5% | No |
-| Bank API Timeout | 3% | Yes |
-| Insufficient Funds | 3% | Yes |
-| Account Blocked | 2% | No |
-| Rate Limited | 2% | Yes |
+```bash
+# Create test database
+createdb -h localhost -U postgres kaveri_payouts_test
+psql -h localhost -U postgres -d kaveri_payouts_test -f migrations/001_init.sql
 
-Failed payouts with retryable errors are automatically retried up to 3 times during batch processing.
+# Run integration tests
+go test ./internal/worker/ -v -count=1
+```
+
+Tests cover:
+- **TestBatchProcessingCompletesAll**: All payouts are processed (completed or failed)
+- **TestIdempotency**: Running same batch twice doesn't create duplicate payments
+- **TestResumability**: Interrupted batch resumes correctly without data loss

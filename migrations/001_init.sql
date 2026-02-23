@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS payouts (
     currency         VARCHAR(3) NOT NULL DEFAULT 'USD',
     bank_account     VARCHAR(100),
     bank_name        VARCHAR(255),
+    transaction_ids  TEXT[],
     status           VARCHAR(20) NOT NULL DEFAULT 'pending'
                      CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
     failure_reason   TEXT,

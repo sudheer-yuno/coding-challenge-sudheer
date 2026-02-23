@@ -57,6 +57,7 @@ type Payout struct {
 	Currency       string     `json:"currency"`
 	BankAccount    string     `json:"bank_account,omitempty"`
 	BankName       string     `json:"bank_name,omitempty"`
+	TransactionIDs []string   `json:"transaction_ids,omitempty"`
 	Status         string     `json:"status"`
 	FailureReason  *string    `json:"failure_reason,omitempty"`
 	AttemptCount   int        `json:"attempt_count"`
@@ -91,8 +92,9 @@ type CreatePayoutItem struct {
 	VendorName  string  `json:"vendor_name"`
 	Amount      float64 `json:"amount" binding:"required,gt=0"`
 	Currency    string  `json:"currency" binding:"required"`
-	BankAccount string  `json:"bank_account" binding:"required"`
-	BankName    string  `json:"bank_name"`
+	BankAccount     string   `json:"bank_account" binding:"required"`
+	BankName        string   `json:"bank_name"`
+	TransactionIDs  []string `json:"transaction_ids"`
 }
 
 // BatchSummary is the response for batch status queries.
