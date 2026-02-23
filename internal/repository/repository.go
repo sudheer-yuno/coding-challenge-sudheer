@@ -139,17 +139,18 @@ func (r *Repository) RefreshBatchCounts(ctx context.Context, batchID uuid.UUID) 
 
 // --- Payout Operations ---
 
-// GetPendingPayouts retrieves payouts that need processing (pending or stuck in processing).
+// GetPendingPayouts retrieves payouts that need processing (pending only).
+// Crash recovery for stuck "processing" payouts is handled separately by ResetStuckProcessing.
 func (r *Repository) GetPendingPayouts(ctx context.Context, batchID uuid.UUID, limit int) ([]models.Payout, error) {
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT id, batch_id, idempotency_key, vendor_id, vendor_name, amount, currency,
 		        bank_account, bank_name, transaction_ids, status, failure_reason, attempt_count, max_retries,
 		        created_at, attempted_at, completed_at, updated_at
 		 FROM payouts
-		 WHERE batch_id = $1 AND status IN ($2, $3)
+		 WHERE batch_id = $1 AND status = $2
 		 ORDER BY created_at ASC
-		 LIMIT $4`,
-		batchID, models.PayoutStatusPending, models.PayoutStatusProcessing, limit,
+		 LIMIT $3`,
+		batchID, models.PayoutStatusPending, limit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query pending payouts: %w", err)
@@ -159,15 +160,17 @@ func (r *Repository) GetPendingPayouts(ctx context.Context, batchID uuid.UUID, l
 	return scanPayouts(rows)
 }
 
-// ClaimPayout atomically transitions a payout from pending/processing to processing.
+// ClaimPayout atomically transitions a payout from pending to processing.
 // Returns true if the payout was successfully claimed.
+// Only claims payouts in "pending" state to prevent concurrent workers from
+// double-processing the same payout.
 func (r *Repository) ClaimPayout(ctx context.Context, payoutID uuid.UUID) (bool, error) {
 	now := time.Now().UTC()
 	result, err := r.db.ExecContext(ctx,
 		`UPDATE payouts SET status = $1, attempted_at = $2, attempt_count = attempt_count + 1, updated_at = $2
-		 WHERE id = $3 AND status IN ($4, $5)`,
+		 WHERE id = $3 AND status = $4`,
 		models.PayoutStatusProcessing, now, payoutID,
-		models.PayoutStatusPending, models.PayoutStatusProcessing,
+		models.PayoutStatusPending,
 	)
 	if err != nil {
 		return false, fmt.Errorf("claim payout: %w", err)

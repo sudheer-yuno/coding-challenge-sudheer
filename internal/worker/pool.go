@@ -19,6 +19,7 @@ type Pool struct {
 	repo        *repository.Repository
 	concurrency int
 	chunkSize   int
+	mu          sync.Mutex  // protects stopCh
 	stopCh      chan struct{}
 	running     atomic.Bool
 }
@@ -41,6 +42,12 @@ func (p *Pool) ProcessBatch(ctx context.Context, batchID uuid.UUID) error {
 	}
 	defer p.running.Store(false)
 
+	// Create a fresh stop channel for this run so the pool can be reused after Stop().
+	p.mu.Lock()
+	p.stopCh = make(chan struct{})
+	stopCh := p.stopCh
+	p.mu.Unlock()
+
 	log.Printf("[processor] Starting batch %s with concurrency=%d, chunk=%d", batchID, p.concurrency, p.chunkSize)
 
 	// Step 1: Reset any payouts stuck in "processing" from a previous crash
@@ -60,7 +67,7 @@ func (p *Pool) ProcessBatch(ctx context.Context, batchID uuid.UUID) error {
 	// Step 3: Process in chunks
 	for {
 		select {
-		case <-p.stopCh:
+		case <-stopCh:
 			log.Printf("[processor] Received stop signal, pausing batch %s", batchID)
 			return nil
 		case <-ctx.Done():
@@ -81,7 +88,7 @@ func (p *Pool) ProcessBatch(ctx context.Context, batchID uuid.UUID) error {
 		log.Printf("[processor] Processing chunk of %d payouts", len(payouts))
 
 		// Process chunk with worker pool
-		p.processChunk(ctx, payouts)
+		p.processChunk(ctx, stopCh, payouts)
 
 		// Refresh batch counts
 		if err := p.repo.RefreshBatchCounts(ctx, batchID); err != nil {
@@ -119,16 +126,17 @@ func (p *Pool) ProcessBatch(ctx context.Context, batchID uuid.UUID) error {
 }
 
 // processChunk processes a slice of payouts concurrently.
-func (p *Pool) processChunk(ctx context.Context, payouts []models.Payout) {
+func (p *Pool) processChunk(ctx context.Context, stopCh chan struct{}, payouts []models.Payout) {
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, p.concurrency)
 
+outer:
 	for _, payout := range payouts {
 		select {
-		case <-p.stopCh:
-			break
+		case <-stopCh:
+			break outer
 		case <-ctx.Done():
-			break
+			break outer
 		default:
 		}
 
@@ -204,7 +212,12 @@ func (p *Pool) processSinglePayout(ctx context.Context, payout models.Payout) {
 
 // Stop signals the pool to stop processing after the current chunk.
 func (p *Pool) Stop() {
-	if p.running.Load() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	select {
+	case <-p.stopCh:
+		// Already closed, no-op
+	default:
 		close(p.stopCh)
 	}
 }

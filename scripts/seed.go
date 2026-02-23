@@ -135,8 +135,17 @@ func createBatch(baseURL string, count, batchNum int) string {
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusCreated {
+		fmt.Fprintf(os.Stderr, "Failed to create batch (status %d): %s\n", resp.StatusCode, string(respBody))
+		return ""
+	}
+
 	var result map[string]interface{}
-	json.Unmarshal(respBody, &result)
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing create batch response: %v\n", err)
+		os.Exit(1)
+	}
 
 	if batchID, ok := result["batch_id"].(string); ok {
 		return batchID

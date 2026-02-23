@@ -178,6 +178,11 @@ func (h *Handler) RetryFailed(c *gin.Context) {
 		return
 	}
 
+	if h.pool.IsRunning() {
+		c.JSON(http.StatusConflict, gin.H{"error": "A batch is already being processed"})
+		return
+	}
+
 	// Start processing again
 	go func() {
 		ctx := context.Background()
